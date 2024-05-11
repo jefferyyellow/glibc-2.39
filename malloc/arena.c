@@ -25,6 +25,7 @@
 /* Compile-time constants.  */
 
 #define HEAP_MIN_SIZE (32 * 1024)
+/* HEAP_MAX_SIZE：根据操作系统取值，32位 1M；64位 64M*/
 #ifndef HEAP_MAX_SIZE
 # ifdef DEFAULT_MMAP_THRESHOLD_MAX
 #  define HEAP_MAX_SIZE (2 * DEFAULT_MMAP_THRESHOLD_MAX)
@@ -61,19 +62,23 @@ heap_max_size (void)
 
 /* A heap is a single contiguous memory region holding (coalesceable)
    malloc_chunks.  It is allocated with mmap() and always starts at an
-   address aligned to HEAP_MAX_SIZE.  */
-
+   address aligned to HEAP_MAX_SIZE.  
+   堆是保存（可合并）malloc_chunk的单个连续内存区域。它通过mmap()进行分配，
+   并且始终从与HEAP_MAX_SIZE对齐的地址开始。
+   */
 typedef struct _heap_info
 {
-  mstate ar_ptr; /* Arena for this heap. */
-  struct _heap_info *prev; /* Previous heap. */
-  size_t size;   /* Current size in bytes. */
-  size_t mprotect_size; /* Size in bytes that has been mprotected
+  mstate ar_ptr; /* Arena for this heap. 指向该堆的分配区*/
+  struct _heap_info *prev; /* Previous heap. 链表，指向前一个堆*/
+  size_t size;   /* Current size in bytes. 当前堆的大小*/
+  size_t mprotect_size; /* Size in bytes that has been mprotected 记录了堆中多大的空间是可读写的
                            PROT_READ|PROT_WRITE.  */
-  size_t pagesize; /* Page size used when allocating the arena.  */
+  size_t pagesize; /* Page size used when allocating the arena.  分配时的页面大小*/
   /* Make sure the following data is properly aligned, particularly
      that sizeof (heap_info) + 2 * SIZE_SZ is a multiple of
-     MALLOC_ALIGNMENT. */
+     MALLOC_ALIGNMENT. 
+     确保以下数据正确对齐，特别是sizeof(heap_info)+2*SIZE_SZ是MALLOC_ALIGNMENT的倍数。
+     用以堆其该结构体，使其能够按照0x10字节对齐(x86中则是8字节对齐)*/
   char pad[-3 * SIZE_SZ & MALLOC_ALIGN_MASK];
 } heap_info;
 
@@ -84,7 +89,7 @@ extern int sanity_check_heap_info_alignment[(sizeof (heap_info)
                                             ? -1 : 1];
 
 /* Thread specific data.  */
-
+// 线程指定数据
 static __thread mstate thread_arena attribute_tls_model_ie;
 
 /* Arena free list.  free_list_lock synchronizes access to the
@@ -124,7 +129,14 @@ static bool __malloc_initialized = false;
    once over the circularly linked list of arenas.  If no arena is
    readily available, create a new one.  In this latter case, `size'
    is just a hint as to how much memory will be required immediately
-   in the new arena. */
+   in the new arena. 
+   
+   1. 先从私有变量中thread_arena尝试获取分配区，不同线程都会设置自己的分配区
+   2. 如果分配区存在，则加锁进行处理，直接返回当前分配区
+   3. 如果分配区不存在，则调用arena_get2函数，从空闲链表或者新创建分配区
+   4. thread_arena = &main_arena;  进程的主线程对应的是主分配区
+   5. 如果当前线程没有设置过分配区，则通过arena_get2进行分配区的申请
+   */
 
 #define arena_get(ptr, size) do { \
       ptr = thread_arena;						      \
@@ -293,8 +305,9 @@ ptmalloc_init (void)
     __always_fail_morecore = true;
 #endif
 
+  // main_arena为主分配区域
   thread_arena = &main_arena;
-
+  // 初始化主分配区数据
   malloc_init_state (&main_arena);
 
   TUNABLE_GET (top_pad, size_t, TUNABLE_CALLBACK (set_top_pad));
@@ -373,7 +386,10 @@ static char *aligned_heap_area;
 
 /* Create a new heap.  size is automatically rounded up to a multiple
    of the page size. */
-
+// 创建一个新的堆，大小会自动向上取整为页大小的倍数。
+/* 创建一个新的堆空间从mmap区域映射一块内存页来作为heap分配的页大小：
+ * 在32位系统上，该函数每次映射1M内存，映射的内存块地址按1M对齐；
+ * 在64为系统上，该函数映射64M内存，映射的内存块地址按64M对齐。*/
 static heap_info *
 alloc_new_heap  (size_t size, size_t top_pad, size_t pagesize,
 		 int mmap_flags)
@@ -384,6 +400,7 @@ alloc_new_heap  (size_t size, size_t top_pad, size_t pagesize,
   size_t min_size = heap_min_size ();
   size_t max_size = heap_max_size ();
 
+  // size在HEAP_MIN_SIZE和HEAP_MAX_SIZE之间，最小：HEAP_MIN_SIZE，超过HEAP_MAX_SIZE则返回0 
   if (size + top_pad < min_size)
     size = min_size;
   else if (size + top_pad <= max_size)
@@ -392,15 +409,19 @@ alloc_new_heap  (size_t size, size_t top_pad, size_t pagesize,
     return 0;
   else
     size = max_size;
+  // 根据页面大小向上取整
   size = ALIGN_UP (size, pagesize);
 
   /* A memory region aligned to a multiple of max_size is needed.
      No swap space needs to be reserved for the following large
      mapping (on Linux, this is the case for all non-writable mappings
      anyway). */
+
+	/* aligned_heap_area: 是上一次调用mmap分配内存的结束虚拟地址，并已经按照HEAP_MAX_SIZE大小对齐。
+	 * 如果aligned_heap_area不为空，则从上次虚拟内存地址开始映射HEAP_MAX_SIZE大小的地址 */     
   p2 = MAP_FAILED;
   if (aligned_heap_area)
-    {
+  {
       p2 = (char *) MMAP (aligned_heap_area, max_size, PROT_NONE, mmap_flags);
       aligned_heap_area = NULL;
       if (p2 != MAP_FAILED && ((unsigned long) p2 & (max_size - 1)))
@@ -408,18 +429,25 @@ alloc_new_heap  (size_t size, size_t top_pad, size_t pagesize,
           __munmap (p2, max_size);
           p2 = MAP_FAILED;
         }
-    }
+  }
+
+	/* 如果第一次分配（aligned_heap_area=NULL）或者P2分配失败（aligned_heap_area不为NULL），则开始重新分配
+	 * p1表示第一次分配，调用MMAP分配2倍HEAP_MAX_SIZE的内存映射块，本次使用内存块的第一块部分，并将aligned_heap_area指向第二块部分*/
   if (p2 == MAP_FAILED)
     {
+      // 尝试分配max_size的2倍大小
       p1 = (char *) MMAP (0, max_size << 1, PROT_NONE, mmap_flags);
+      // 分配成功
       if (p1 != MAP_FAILED)
         {
+          // 地址对齐到max_size
           p2 = (char *) (((uintptr_t) p1 + (max_size - 1))
                          & ~(max_size - 1));
           ul = p2 - p1;
           if (ul)
             __munmap (p1, ul);
           else
+            // 记录下一次分配的地址值
             aligned_heap_area = p2 + max_size;
           __munmap (p2 + max_size, max_size - ul);
         }
@@ -427,6 +455,7 @@ alloc_new_heap  (size_t size, size_t top_pad, size_t pagesize,
         {
           /* Try to take the chance that an allocation of only max_size
              is already aligned. */
+          // 尝试只分配max_size大小的内存
           p2 = (char *) MMAP (0, max_size, PROT_NONE, mmap_flags);
           if (p2 == MAP_FAILED)
             return 0;
@@ -438,6 +467,7 @@ alloc_new_heap  (size_t size, size_t top_pad, size_t pagesize,
             }
         }
     }
+  // 写入页面的保护标志，注意，这个是已经映射好了最大尺寸，但是只对size进行页面写保护
   if (__mprotect (p2, size, mtag_mmap_flags | PROT_READ | PROT_WRITE) != 0)
     {
       __munmap (p2, max_size);
@@ -448,8 +478,9 @@ alloc_new_heap  (size_t size, size_t top_pad, size_t pagesize,
   __set_vma_name (p2, size, " glibc: malloc arena");
 
   madvise_thp (p2, size);
-
+  // 新的heap_info
   h = (heap_info *) p2;
+  // 设置大小
   h->size = size;
   h->mprotect_size = size;
   h->pagesize = pagesize;
@@ -457,6 +488,7 @@ alloc_new_heap  (size_t size, size_t top_pad, size_t pagesize,
   return h;
 }
 
+// 创建一个堆空间
 static heap_info *
 new_heap (size_t size, size_t top_pad)
 {
@@ -472,7 +504,7 @@ new_heap (size_t size, size_t top_pad)
 
 /* Grow a heap.  size is automatically rounded up to a
    multiple of the page size. */
-
+// 对堆进行扩容，大小自动圆整到页面大小的倍数
 static int
 grow_heap (heap_info *h, long diff)
 {
@@ -482,9 +514,10 @@ grow_heap (heap_info *h, long diff)
 
   diff = ALIGN_UP (diff, pagesize);
   new_size = (long) h->size + diff;
+  // 不能大于最大值
   if ((unsigned long) new_size > (unsigned long) max_size)
     return -1;
-
+  // 大于原来的大小，需要将新的区域写入保护标志
   if ((unsigned long) new_size > h->mprotect_size)
     {
       if (__mprotect ((char *) h + h->mprotect_size,
@@ -494,27 +527,32 @@ grow_heap (heap_info *h, long diff)
 
       h->mprotect_size = new_size;
     }
-
+  // 设置新的值
   h->size = new_size;
   LIBC_PROBE (memory_heap_more, 2, h, h->size);
   return 0;
 }
 
 /* Shrink a heap.  */
-
+// 收缩一个堆
 static int
 shrink_heap (heap_info *h, long diff)
 {
   long new_size;
-
+  // 计算新的大小
   new_size = (long) h->size - diff;
   if (new_size < (long) sizeof (*h))
     return -1;
 
   /* Try to re-map the extra heap space freshly to save memory, and make it
-     inaccessible.  See malloc-sysdep.h to know when this is true.  */
+     inaccessible.  See malloc-sysdep.h to know when this is true.  
+     尝试重新映射额外的堆空间以节省内存，并使其不可访问。 请参阅malloc-sysdep.h了解何时是这样。
+     */
   if (__glibc_unlikely (check_may_shrink_heap ()))
     {
+      // 将h+new_size后面的diff大小设置为不可访问
+      // MAP_FIXED //使用指定的映射起始地址，如果由start和len参数指定的内存区重叠于现存的映射空间，重叠部分将会被丢弃。
+      // 如果指定的起始地址不可用，操作将会失败。并且起始地址必须落在页的边界上。
       if ((char *) MMAP ((char *) h + new_size, diff, PROT_NONE,
                          MAP_FIXED) == (char *) MAP_FAILED)
         return -2;
@@ -524,14 +562,14 @@ shrink_heap (heap_info *h, long diff)
   else
     __madvise ((char *) h + new_size, diff, MADV_DONTNEED);
   /*fprintf(stderr, "shrink %p %08lx\n", h, new_size);*/
-
+  // 设置新的尺寸
   h->size = new_size;
   LIBC_PROBE (memory_heap_less, 2, h, h->size);
   return 0;
 }
 
 /* Delete a heap. */
-
+// 删除一个堆
 static int
 heap_trim (heap_info *heap, size_t pad)
 {
@@ -542,6 +580,7 @@ heap_trim (heap_info *heap, size_t pad)
   size_t max_size = heap_max_size ();
 
   /* Can this heap go away completely? */
+  // 该堆会完全消失吗？
   while (top_chunk == chunk_at_offset (heap, sizeof (*heap)))
     {
       prev_heap = heap->prev;
@@ -627,6 +666,11 @@ detach_arena (mstate replaced_arena)
     }
 }
 
+/**
+ * 初始化一个新的分配区arena
+ * 该函数主要创建：非主分配区
+ * 主分配区在ptmalloc_init中初始化，并且设置了全局变量main_arena的值
+ */
 static mstate
 _int_new_arena (size_t size)
 {
@@ -634,7 +678,8 @@ _int_new_arena (size_t size)
   heap_info *h;
   char *ptr;
   unsigned long misalign;
-
+  
+  /* 分配一个heap_info，用于记录堆的信息，非主分配区一般都是通过MMAP向系统申请内存；非主分配区申请后，是不能被销毁的 */
   h = new_heap (size + (sizeof (*h) + sizeof (*a) + MALLOC_ALIGNMENT),
                 mp_.top_pad);
   if (!h)
@@ -647,7 +692,9 @@ _int_new_arena (size_t size)
         return 0;
     }
   a = h->ar_ptr = (mstate) (h + 1);
+  //初始化mstate
   malloc_init_state (a);
+  //设置进程关联个数
   a->attached_threads = 1;
   /*a->next = NULL;*/
   a->system_mem = a->max_system_mem = h->size;
@@ -662,12 +709,15 @@ _int_new_arena (size_t size)
 
   LIBC_PROBE (memory_arena_new, 2, a, size);
   mstate replaced_arena = thread_arena;
+  //将当前线程设置mstate
   thread_arena = a;
+  //初始化分配区锁
   __libc_lock_init (a->mutex);
 
   __libc_lock_lock (list_lock);
 
   /* Add the new arena to the global list.  */
+  // 将新的分配区加入到全局链表上，新申请的分配区都会放入主分配区的下一个位置*/
   a->next = main_arena.next;
   /* FIXME: The barrier is an attempt to synchronize with read access
      in reused_arena, which does not acquire list_lock while
@@ -677,6 +727,7 @@ _int_new_arena (size_t size)
 
   __libc_lock_unlock (list_lock);
 
+	/* 调整attached_threads状态*/
   __libc_lock_lock (free_list_lock);
   detach_arena (replaced_arena);
   __libc_lock_unlock (free_list_lock);
@@ -690,7 +741,7 @@ _int_new_arena (size_t size)
      to make it less likely that reused_arena picks this new arena,
      but this could result in a deadlock with
      __malloc_fork_lock_parent.  */
-
+  //解除分配区锁
   __libc_lock_lock (a->mutex);
 
   return a;
@@ -698,32 +749,42 @@ _int_new_arena (size_t size)
 
 
 /* Remove an arena from free_list.  */
+/* 通过全局变量free_list保存空闲链表。如果空闲链表为空，则直接返回空的值，如果不为空，
+ * 则调整free_list的变量值为free_list->next。将attached_threads的值设置成1，
+ * 说明已经有线程绑定该分配区进行使用了。最后需要将thread_arena的线程私有变量，设置成分配区。
+ */
 static mstate
 get_free_list (void)
 {
+  //获取当前线程分配区
   mstate replaced_arena = thread_arena;
+  /* free_list为全局变量 */
   mstate result = free_list;
   if (result != NULL)
     {
       __libc_lock_lock (free_list_lock);
+      //再次获取free_list
       result = free_list;
       if (result != NULL)
-	{
-	  free_list = result->next_free;
+      {
+        // free_list指向下一个节点
+        free_list = result->next_free;
 
-	  /* The arena will be attached to this thread.  */
-	  assert (result->attached_threads == 0);
-	  result->attached_threads = 1;
-
-	  detach_arena (replaced_arena);
-	}
+        /* The arena will be attached to this thread.  */
+        assert (result->attached_threads == 0);
+        // 附加的进程为1
+        result->attached_threads = 1;
+        // 减少原来分配区附加的进程数
+        detach_arena (replaced_arena);
+      }
       __libc_lock_unlock (free_list_lock);
 
       if (result != NULL)
         {
           LIBC_PROBE (memory_arena_reuse_free_list, 1, result);
           __libc_lock_lock (result->mutex);
-	  thread_arena = result;
+          // 设置新的线程分配区
+	        thread_arena = result;
         }
     }
 
@@ -753,6 +814,7 @@ remove_from_free_list (mstate arena)
 /* Lock and return an arena that can be reused for memory allocation.
    Avoid AVOID_ARENA as we have already failed to allocate memory in
    it and it is currently locked.  */
+// 如果分配区全部处于忙碌中，则通过遍历方式，尝试没有加锁的分配区进行分配操作
 static mstate
 reused_arena (mstate avoid_arena)
 {
@@ -764,9 +826,11 @@ reused_arena (mstate avoid_arena)
 
   /* Iterate over all arenas (including those linked from
      free_list).  */
+  // 遍历整个分配区链表
   result = next_to_use;
   do
     {
+      // 寻找一个沒有锁定的分配区
       if (!__libc_lock_trylock (result->mutex))
         goto out;
 
@@ -777,10 +841,12 @@ reused_arena (mstate avoid_arena)
 
   /* Avoid AVOID_ARENA as we have already failed to allocate memory
      in that arena and it is currently locked.   */
+  // 不能是传入的分配区，因为其已经分配内存失败了并且也已经锁定
   if (result == avoid_arena)
     result = result->next;
 
   /* No arena available without contention.  Wait for the next in line.  */
+  // 没有可用的分配区，等待下一次排队
   LIBC_PROBE (memory_arena_reuse_wait, 3, &result->mutex, result, avoid_arena);
   __libc_lock_lock (result->mutex);
 
@@ -788,6 +854,7 @@ out:
   /* Attach the arena to the current thread.  */
   {
     /* Update the arena thread attachment counters.   */
+    // 更新原来的分配区的关联线程计数
     mstate replaced_arena = thread_arena;
     __libc_lock_lock (free_list_lock);
     detach_arena (replaced_arena);
@@ -800,15 +867,18 @@ out:
        remove the selected arena from the free list.  The caller of
        reused_arena checked the free list and observed it to be empty,
        so the list is very short.  */
+    // 从空闲链表中移除该分配区
     remove_from_free_list (result);
-
+    // 关联的线程计数+1
     ++result->attached_threads;
 
     __libc_lock_unlock (free_list_lock);
   }
 
   LIBC_PROBE (memory_arena_reuse, 2, result, avoid_arena);
+  // 新的分配区
   thread_arena = result;
+  // 下次开始尝试的地方
   next_to_use = result->next;
 
   return result;
@@ -820,11 +890,20 @@ arena_get2 (size_t size, mstate avoid_arena)
   mstate a;
 
   static size_t narenas_limit;
-
+  // 从空闲列表中获取一个分配区
   a = get_free_list ();
+  // 如果空闲链表为NULL，则创建一个新的arean分配区 
   if (a == NULL)
     {
       /* Nothing immediately available, so generate a new arena.  */
+      
+		/* Nothing immediately available, so generate a new arena.  */
+		/* 多少个分配区，根据系统来决定，一个进程最多能分配的arena个数在64位下是8 * core，32位下是2 * core个
+		 * arena 对于32位系统，数量最多为核心数量2倍，64位则最多为核心数量8倍，可以用来保证多线程的堆空间分配的高效性。
+		 * 主要存储了较高层次的一些信息。有一个main_arena，是由主线程创建的，thread_arena则为各线程创建的，
+		 * 当arena满了之后就不再创建而是与其他arena共享一个arena，方法为依次给各个arena上锁（查看是否有其他线程正在使用该arena），
+		 * 如果上锁成功（没有其他线程正在使用），则使用该arena，之后一直使用这个arena，如果无法使用则阻塞等待。
+		 *  */
       if (narenas_limit == 0)
         {
           if (mp_.arena_max != 0)
@@ -850,14 +929,17 @@ arena_get2 (size_t size, mstate avoid_arena)
          narenas_limit is 0.  There is no possibility for narenas to
          be too big for the test to always fail since there is not
          enough address space to create that many arenas.  */
+      // 没有超出上限，创建一个新的分配区
       if (__glibc_unlikely (n <= narenas_limit - 1))
         {
           if (catomic_compare_and_exchange_bool_acq (&narenas, n + 1, n))
             goto repeat;
+          // 创建一个新的分区
           a = _int_new_arena (size);
 	  if (__glibc_unlikely (a == NULL))
             catomic_decrement (&narenas);
         }
+      // 复用默认分区
       else
         a = reused_arena (avoid_arena);
     }
